@@ -30,6 +30,9 @@ POLL_INTERVAL    = 30  # секунд
 WEEKLY_POST_DAY  = 4   # 0=пн … 6=вс, 4=пт
 WEEKLY_POST_HOUR = 14  # 19:00 Алматы (UTC+5)
 
+# Сколько ошибок подряд — перед алертом в Telegram
+ERROR_ALERT_THRESHOLD = 10
+
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
@@ -120,18 +123,46 @@ def mark_week_posted(week_key: str):
 
 # ── LAST.FM ───────────────────────────────────────────────────────────────────
 def get_current_track() -> dict | None:
-    resp = requests.get(
-        "https://ws.audioscrobbler.com/2.0/",
-        params={
-            "method":  "user.getrecenttracks",
-            "user":    LASTFM_USERNAME,
-            "api_key": LASTFM_API_KEY,
-            "format":  "json",
-            "limit":   1,
-        },
-        timeout=10,
-    )
-    resp.raise_for_status()
+    """
+    Запрашивает текущий трек с Last.fm.
+    При 500/502/таймауте — до 3 попыток с экспоненциальным backoff (2, 4, 8 сек).
+    Если все попытки провалились — возвращает None и логирует WARNING (не ERROR).
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(
+                "https://ws.audioscrobbler.com/2.0/",
+                params={
+                    "method":  "user.getrecenttracks",
+                    "user":    LASTFM_USERNAME,
+                    "api_key": LASTFM_API_KEY,
+                    "format":  "json",
+                    "limit":   1,
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            break  # успех — выходим из цикла
+        except requests.exceptions.Timeout:
+            wait = 2 ** (attempt + 1)
+            log.warning("Last.fm timeout (attempt %d/%d), retrying in %ds…", attempt + 1, max_retries, wait)
+            if attempt < max_retries - 1:
+                time.sleep(wait)
+            else:
+                return None  # тихо — не ERROR
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            if status in (500, 502, 503):
+                wait = 2 ** (attempt + 1)
+                log.warning("Last.fm %d (attempt %d/%d), retrying in %ds…", status, attempt + 1, max_retries, wait)
+                if attempt < max_retries - 1:
+                    time.sleep(wait)
+                else:
+                    return None  # тихо — серверная проблема, не наша вина
+            else:
+                raise  # 401, 403 и т.д. — пробрасываем, это уже проблема
+
     tracks = resp.json().get("recenttracks", {}).get("track", [])
     if not tracks:
         return None
@@ -225,6 +256,8 @@ def main():
     init_db()
     log.info("Bot started. Polling every %ds.", POLL_INTERVAL)
     last_id: str | None = None
+    consecutive_errors  = 0
+    alert_sent          = False  # чтобы не спамить одно и то же
 
     while True:
         try:
@@ -236,12 +269,32 @@ def main():
             elif not track:
                 last_id = None
 
+            # Всё хорошо — сбрасываем счётчик ошибок
+            if consecutive_errors > 0:
+                log.info("Last.fm recovered after %d failed polls.", consecutive_errors)
+            consecutive_errors = 0
+            alert_sent         = False
+
             now = datetime.now()
             if now.weekday() == WEEKLY_POST_DAY and now.hour == WEEKLY_POST_HOUR:
                 post_weekly_report()
 
         except requests.RequestException as e:
+            consecutive_errors += 1
             log.error("Network error: %s", e)
+
+            # Алерт в Telegram если ошибки идут подряд слишком долго
+            if consecutive_errors >= ERROR_ALERT_THRESHOLD and not alert_sent:
+                try:
+                    tg_post(
+                        f"⚠️ <b>Last.fm недоступен</b>\n"
+                        f"Уже <b>{consecutive_errors}</b> неудачных попыток подряд.\n"
+                        f"Последняя ошибка: <code>{e}</code>"
+                    )
+                    alert_sent = True
+                except Exception:
+                    pass  # если и Telegram не работает — не падаем
+
         except Exception as e:
             log.exception("Unexpected error: %s", e)
 
